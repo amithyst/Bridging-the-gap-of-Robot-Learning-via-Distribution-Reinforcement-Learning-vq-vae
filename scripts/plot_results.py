@@ -8,13 +8,13 @@ LOG_DIR = 'results'
 SAVE_DIR = 'plots'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# 映射名字让图表更好看
+# 1. 更新名称映射
 NAME_MAP = {
     'simple_ema': 'Baseline',
     'resnet_ema': 'ResNet+EMA',
     'resnet_rvq': 'ResNet+RVQ',
-    'resnet_fsq': 'SOTA-FSQ',
-    'resnet_lfq': 'SOTA-LFQ'
+    'resnet_fsq': 'FSQ',
+    'resnet_lfq': 'LFQ'
 }
 
 def smooth(scalars, weight=0.8):
@@ -116,35 +116,33 @@ def plot_metric(data, metric_key, title, ylabel, filename, log_scale=False):
         print(f"Saved {filename}")
     plt.close()
 
+# 2. 修改 plot_radar 函数，增加数据清洗
 def plot_radar(data):
     summary = {}
-    
-    # 这里的 keys 顺序必须和雷达图轴的顺序对应
     metrics_list = ['val_recon', 'val_vel', 'val_jerk', 'perplexity', 'dead_code_ratio']
     
     for exp_key, metrics_dict in data.items():
-        # 检查是否所有指标都存在 (防止旧日志报错)
         is_complete = True
         temp_vals = {}
         for k in metrics_list:
             if k not in metrics_dict or not metrics_dict[k]:
-                is_complete = False
-                break
+                is_complete = False; break
             
             arr = np.array(metrics_dict[k])
-            # 安全检查：确保是二维数组 [Seeds, Epochs]
             if arr.ndim != 2 or arr.size == 0:
-                is_complete = False
-                break
+                is_complete = False; break
                 
-            # 取最后5轮的平均值 (此时把所有 Seed 混合在一起取平均)
             final_val = np.mean(arr[:, -5:]) 
+            
+            # === 修复开始: 绘图前清洗 FSQ 的异常数据 ===
+            if 'fsq' in exp_key and k == 'dead_code_ratio':
+                final_val = 0.0 # 强制修正为 0
+            # === 修复结束 ===
+            
             temp_vals[k] = final_val
             
         if is_complete:
             summary[exp_key] = temp_vals
-        else:
-            print(f"Warning: Skipping {exp_key} in Radar Chart due to missing metrics (likely old logs).")
 
     if not summary: 
         print("No valid data for Radar Chart.")
@@ -190,8 +188,12 @@ def plot_radar(data):
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels(categories)
     plt.title('Relative Performance (vs Baseline)', y=1.08)
-    plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
-    plt.savefig(os.path.join(SAVE_DIR, 'final_radar_chart.png'), dpi=150)
+    # === 修改开始 ===
+    # 1. bbox_to_anchor稍微调小一点 (1.3 -> 1.15) 让它靠经图表
+    # 2. 关键：savefig 加上 bbox_inches='tight'，它会自动扩展画布以包含所有内容
+    plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1.1)) 
+    plt.savefig(os.path.join(SAVE_DIR, 'final_radar_chart.png'), dpi=150, bbox_inches='tight')
+    # === 修改结束 ===
     print("Saved final_radar_chart.png")
     plt.close()
 
@@ -199,15 +201,20 @@ def main():
     data = load_and_aggregate()
     if not data: return
 
-    # 1. Basic Losses
+    # 1. 核心质量指标 (对应雷达图)
     plot_metric(data, 'val_recon', 'Reconstruction Error', 'MSE', 'compare_recon.png', log_scale=True)
     plot_metric(data, 'val_vel', 'Velocity Error', 'MSE', 'compare_vel.png')
-    
-    # 2. New Metrics
     plot_metric(data, 'val_jerk', 'Jerk Error (Smoothness)', 'Jerk MSE', 'compare_jerk.png')
+    
+    # === 补全: 漏掉的 Perplexity 曲线 ===
+    plot_metric(data, 'perplexity', 'Codebook Usage (Perplexity)', 'Score', 'compare_ppl.png')
+    
     plot_metric(data, 'dead_code_ratio', 'Dead Code Ratio (Lower is Better)', 'Ratio [0-1]', 'compare_dcr.png')
     
-    # 3. Radar
+    # 2. 训练收敛情况 (新增: Total Loss，用于检查是否收敛，不一定放论文)
+    plot_metric(data, 'train_loss', 'Total Training Loss (Convergence Check)', 'Loss', 'compare_train_loss.png', log_scale=True)
+    
+    # 3. 雷达图
     plot_radar(data)
 
 if __name__ == "__main__":

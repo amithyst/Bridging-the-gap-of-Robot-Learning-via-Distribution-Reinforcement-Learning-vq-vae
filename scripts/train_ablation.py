@@ -19,8 +19,10 @@ ABLATION_EXPERIMENTS = [
     {'name': 'Proposed (ResNet+EMA)', 'arch': 'resnet', 'method': 'ema'},
     {'name': 'Advanced (ResNet+RVQ)', 'arch': 'resnet', 'method': 'rvq'},
     {'name': 'SOTA-FSQ (ResNet+FSQ)', 'arch': 'resnet', 'method': 'fsq'},
+    # === 新增下面这一行 ===
+    {'name': 'SOTA-LFQ (ResNet+LFQ)', 'arch': 'resnet', 'method': 'lfq'},
 ]
-SEEDS = [42, 1024] # 减少为2个以快速演示，实际可用更多
+SEEDS = [42, 1024,999,2024,2025] # 减少为2个以快速演示，实际可用更多
 
 BATCH_SIZE = 256
 EPOCHS = 100
