@@ -9,7 +9,7 @@
 
 ## 2. Directory Structure & File Manifest
 (纯文本结构，无代码框)
-
+```bash
 project_root/
 ├── data/
 │   ├── raw/                       # 原始下载及解压数据
@@ -21,15 +21,18 @@ project_root/
 │       └── std.npy                # 用于归一化
 ├── models/
 │   ├── __init__.py
-│   └── vqvae.py                   # 核心模型 (含 Standard, EMA, RVQ 实现)
+│   └── vqvae.py                   # 核心模型 (新增 arch 参数，支持 Simple/ResNet/Transformer)
 ├── scripts/
 │   ├── download_data.py           # ModelScope 数据下载脚本
 │   ├── inspect_npz.py             # 数据结构探查脚本
-│   └── process_data.py            # 数据清洗与切片脚本
+│   ├── process_data.py            # 数据清洗与切片脚本
+│   ├── train_ablation.py          # 训练主脚本 (保存日志至 json，不含绘图)
+│   └── plot_results.py            # 独立绘图脚本 (读取 json 生成 Loss/PPL/Radar 图)
 ├── utils/
 │   ├── __init__.py
-│   └── visualizer.py              # 绘图工具 (待完善)
+│   └── alignment.py              # 不知道干啥的
 └── project_context.md             # 项目上下文文档
+```
 
 ## 3. Dataset Specifications (I/O Protocols)
 
@@ -92,26 +95,49 @@ project_root/
   > 正在计算归一化统计量 (Mean/Std)...
   > Mean/Std 已保存。数据预处理全部完成！
 
-## 5. Model Architecture Specifications (Current Plan)
+## 5. Model Architecture Specifications
 
-### 5.1 VQ-VAE Variants
-代码位于 `models/vqvae.py`，支持通过参数 `method` 切换：
-1.  **Standard:** Euclidean distance + Gradient Descent.
-2.  **EMA:** Exponential Moving Average update (无 Codebook 梯度).
-3.  **RVQ (Residual VQ):** 多层量化器 (Multi-layer Quantizer) 逼近残差。
+### 5.1 Architecture Variants (New)
+代码位于 `models/vqvae.py`，经过重构后支持 `arch` (骨干网络) 和 `method` (量化方法) 的组合配置：
 
-### 5.2 Interface
+1.  **Backbones (`arch`):**
+    -   **Simple:** 2层 Conv1d (Baseline)。
+    -   **ResNet:** 引入 `ResBlock1D`，支持更深的网络和高频特征保持 (Proposed)。
+    -   **Transformer:** Conv 降采样 + Transformer Encoder 处理全局时序 (Ablation)。
+2.  **Quantizers (`method`):**
+    -   **EMA:** 指数移动平均更新，无 Codebook 梯度 (Standard approach)。
+    -   **RVQ (Residual VQ):** 多层残差量化，解决 Codebook Collapse 问题 (Advanced)。
+
+### 5.2 Training Interface
 > class MotionVQVAE(nn.Module):
->     def __init__(self, input_dim=29, hidden_dim=64, method='standard', n_layers=4):
+>     def __init__(self, input_dim=29, hidden_dim=64, arch='resnet', method='ema', ...):
 >         ...
->     def forward(self, x):
->         # Input x: [Batch, DoF, Time]
->         pass
 
-## 6. Next Steps
-1.  **Split Data:** 由于原始数据只有 `train` 文件夹，需要在 DataSet Loader 层面手动划分 Train/Val 集合 (e.g., 90/10 split)。
-2.  **Train:** 编写 `scripts/train_ablation.py`，加载 `.npy` 数据，实例化三种模型进行训练。
-3.  **Visual:** 完善 `utils/visualizer.py` 绘制 Loss 曲线和 Codebook Perplexity。
+**Ablation Study Configs:**
+1.  **Baseline:** Arch=`simple`, Method=`ema`
+2.  **Proposed:** Arch=`resnet`, Method=`ema` (主力模型)
+3.  **Advanced:** Arch=`resnet`, Method=`rvq` (高性能探索)
+
+### 修改 3：更新下一步计划 (Section 6)
+**操作说明：** 请用以下内容替换整个 `Section 6`，反映最新的“训练-绘图”解耦流程。
+
+## 6. Next Steps & Workflow
+
+1.  **Training:**
+    运行 `scripts/train_ablation.py`。
+    -   自动加载 `.npy` 数据。
+    -   执行 Baseline/Proposed/Advanced 三组实验。
+    -   训练过程中计算 **Reconstruction Loss**, **Velocity Loss** (平滑度), **Perplexity**。
+    -   结果保存为 `results/training_log.json`，模型保存为 `checkpoints/*.pth`。
+
+2.  **Visualization:**
+    运行 `scripts/plot_results.py`。
+    -   读取 JSON 日志。
+    -   生成 Loss 对比曲线、PPL 变化曲线。
+    -   生成最终性能对比雷达图 (Radar Chart)。
+
+3.  **Evaluation:**
+    分析图表，确认 ResNet+RVQ 是否解决了 Codebook Collapse 问题，并选择最佳模型部署到 Unitree G1 机器人上。
 
 
 
