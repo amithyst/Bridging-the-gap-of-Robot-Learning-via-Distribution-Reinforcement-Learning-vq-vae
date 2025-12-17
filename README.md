@@ -7,8 +7,9 @@
 ## 1. Project Overview
 本项目旨在利用 VQ-VAE (Vector Quantized Variational Autoencoder) 技术，将人类动作数据对齐并重定向到人形机器人 (Unitree G1) 上。项目核心要求是实现多种 VQ-VAE 变体 (Standard, EMA, RVQ) 进行消融实验，并产出可视化训练曲线与指标对比。
 
-## 2. Directory Structure & File Manifest
-(纯文本结构，无代码框)
+
+### Directory Structure & File Manifest
+
 ```bash
 project_root/
 ├── data/
@@ -21,17 +22,66 @@ project_root/
 │       └── std.npy                # 用于归一化
 ├── models/
 │   ├── __init__.py
-│   └── vqvae.py                   # 核心模型 (新增 arch 参数，支持 Simple/ResNet/Transformer)
+│   └── vqvae.py                   # 核心模型 (支持 Simple/ResNet + EMA/RVQ/FSQ/LFQ)
 ├── scripts/
 │   ├── download_data.py           # ModelScope 数据下载脚本
 │   ├── inspect_npz.py             # 数据结构探查脚本
 │   ├── process_data.py            # 数据清洗与切片脚本
-│   ├── train_ablation.py          # 训练主脚本 (保存日志至 json，不含绘图)
-│   └── plot_results.py            # 独立绘图脚本 (读取 json 生成 Loss/PPL/Radar 图)
+│   ├── train_ablation.py          # 训练主脚本 (多 Seed, 支持 Jerk/DCR 指标)
+│   ├── plot_results.py            # 绘图脚本 (含方差带, Loss/PPL/Jerk/DCR/Radar)
+│   └── export_latex_table.py      # (新增) 读取日志并生成 LaTeX 格式的 Mean±Std 表格
 ├── utils/
 │   ├── __init__.py
-│   └── alignment.py              # 不知道干啥的
+│   └── alignment.py
 └── project_context.md             # 项目上下文文档
+```
+
+## 2. Quick Start & Environment Setup
+
+### 2.1 Dependencies Installation
+运行以下命令安装项目所需依赖：
+```bash
+pip install modelscope torch pandas pinocchio datasets matplotlib
+```
+或者
+```bash
+pip install -r requirements.txt
+```
+### 2.2 Standard Workflow
+按顺序执行以下指令即可完成从数据准备到结果导出的全流程：
+
+1. **Data Download:**
+```bash
+   python scripts/download_data.py
+```
+
+2. **Unzip Data:**
+   (需手动解压至指定目录)
+```bash
+   mkdir -p ./data/raw/unzipped
+   tar -xjf ./data/raw/seulzx/smplx_datasets/lafan1_smplx_datasets.tar.bz2 -C ./data/raw/unzipped
+   tar -xjf ./data/raw/seulzx/smplx_datasets/extended_datasets.tar.bz2 -C ./data/raw/unzipped
+```
+
+3. **Data Inspection (Optional):**
+```bash
+   python scripts/inspect_npz.py
+```
+
+4. **Preprocessing:**
+```bash
+   python scripts/process_data.py
+```
+
+5. **Training (Multi-Seed Ablation):**
+```bash
+   python scripts/train_ablation.py
+```
+
+6. **Result Export & Visualization:**
+```bash
+   python scripts/export_latex_table.py
+   python scripts/plot_results.py
 ```
 
 ## 3. Dataset Specifications (I/O Protocols)
@@ -97,47 +147,43 @@ project_root/
 
 ## 5. Model Architecture Specifications
 
-### 5.1 Architecture Variants (New)
-代码位于 `models/vqvae.py`，经过重构后支持 `arch` (骨干网络) 和 `method` (量化方法) 的组合配置：
+### 5.1 Architecture Variants (Updated)
+代码位于 models/vqvae.py，支持 arch (骨干) 和 method (量化) 的组合，新增 SOTA 方法：
 
 1.  **Backbones (`arch`):**
     -   **Simple:** 2层 Conv1d (Baseline)。
-    -   **ResNet:** 引入 `ResBlock1D`，支持更深的网络和高频特征保持 (Proposed)。
-    -   **Transformer:** Conv 降采样 + Transformer Encoder 处理全局时序 (Ablation)。
+    -   **ResNet:** 引入 ResBlock1D，高频特征保持 (Proposed)。
+    -   **Transformer:** (可选) Conv 降采样 + Transformer Encoder。
 2.  **Quantizers (`method`):**
-    -   **EMA:** 指数移动平均更新，无 Codebook 梯度 (Standard approach)。
-    -   **RVQ (Residual VQ):** 多层残差量化，解决 Codebook Collapse 问题 (Advanced)。
+    -   **EMA:** 指数移动平均更新，无 Codebook 梯度 (Standard)。
+    -   **RVQ (Residual VQ):** 多层残差量化，解决 Codebook Collapse (Advanced)。
+    -   **FSQ (Finite Scalar Quantization):** (SOTA 2024) 无显式 Codebook，通过标量投影与取整实现极高利用率。
+    -   **LFQ (Lookup-Free Quantization):** 基于符号判断 (Sign) 的二值化量化，适合低码率场景。
 
-### 5.2 Training Interface
-> class MotionVQVAE(nn.Module):
->     def __init__(self, input_dim=29, hidden_dim=64, arch='resnet', method='ema', ...):
->         ...
+## 6. Next Steps & Workflow (Updated)
+(请替换原有的 Section 6，反映多种子训练和新指标流程)
 
-**Ablation Study Configs:**
-1.  **Baseline:** Arch=`simple`, Method=`ema`
-2.  **Proposed:** Arch=`resnet`, Method=`ema` (主力模型)
-3.  **Advanced:** Arch=`resnet`, Method=`rvq` (高性能探索)
+1.  **Multi-Seed Training:**
+    运行 scripts/train_ablation.py。
+    -   **配置:** 自动遍历 Baseline, Proposed (ResNet), Advanced (RVQ), SOTA (FSQ, LFQ)。
+    -   **机制:** 每个实验运行多个随机种子 (SEEDS=[42, 1024, ...]) 以评估稳定性。
+    -   **新增指标:**
+        -   **Jerk Loss:** 加加速度 (平滑度指标，越小越好)。
+        -   **Dead Code Ratio (DCR):** 死码率 (Codebook 利用率指标，越小越好)。
+    -   **输出:** 也就是 logs/log_{config}_seed_{seed}.json。
 
-### 修改 3：更新下一步计划 (Section 6)
-**操作说明：** 请用以下内容替换整个 `Section 6`，反映最新的“训练-绘图”解耦流程。
+2.  **Visualization (Variance Band):**
+    运行 scripts/plot_results.py。
+    -   读取多 Seed 日志，自动对齐 Epoch。
+    -   绘制 **Mean ± Std** 阴影曲线图：
+        -   Reconstruction Loss
+        -   Velocity Loss & Jerk Loss (Smoothness)
+        -   Perplexity & Dead Code Ratio (Utilization)
+        -   Train Loss (Convergence Check)
+    -   生成五维雷达图 (Radar Chart): 综合对比各模型性能。
 
-## 6. Next Steps & Workflow
-
-1.  **Training:**
-    运行 `scripts/train_ablation.py`。
-    -   自动加载 `.npy` 数据。
-    -   执行 Baseline/Proposed/Advanced 三组实验。
-    -   训练过程中计算 **Reconstruction Loss**, **Velocity Loss** (平滑度), **Perplexity**。
-    -   结果保存为 `results/training_log.json`，模型保存为 `checkpoints/*.pth`。
-
-2.  **Visualization:**
-    运行 `scripts/plot_results.py`。
-    -   读取 JSON 日志。
-    -   生成 Loss 对比曲线、PPL 变化曲线。
-    -   生成最终性能对比雷达图 (Radar Chart)。
-
-3.  **Evaluation:**
-    分析图表，确认 ResNet+RVQ 是否解决了 Codebook Collapse 问题，并选择最佳模型部署到 Unitree G1 机器人上。
-
-
-
+3.  **Paper Resource Generation:**
+    运行 scripts/export_latex_table.py。
+    -   自动聚合所有 Seed 的最后 5 Epoch 数据。
+    -   计算 Mean ± Std。
+    -   直接输出 LaTeX `booktabs` 格式表格代码，用于论文/报告粘贴。
