@@ -1,7 +1,6 @@
 # Project Context: VQ-VAE for Human-to-Robot Motion Retargeting
 
 **Update Date:** 2025-12-17
-**Current Phase:** Data Preprocessing Completed / Ready for Model Training
 **Robot Target:** Unitree G1 (29 DoF)
 
 ## 1. Project Overview

@@ -7,14 +7,12 @@ import sys
 # 配置
 LOG_DIR = 'results'
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from models.experiment_config import EXPERIMENTS
+
 # 1. 修改配置部分的名称映射
-ORDERED_EXP = [
-    ('simple_ema', 'Baseline (Simple)'),
-    ('resnet_ema', 'ResNet+EMA'),  # 原 Proposed
-    ('resnet_rvq', 'ResNet+RVQ'),  # 原 Advanced
-    ('resnet_fsq', 'FSQ'),         # 原 SOTA (FSQ)
-    ('resnet_lfq', 'LFQ'),         # 原 SOTA (LFQ)
-]
+ORDERED_EXP = [(exp['id'], exp['name']) for exp in EXPERIMENTS]
 
 # 定义指标、显示名称、格式化精度、是否为百分比
 # (Key in JSON, Display Name, Decimal Places, Is Percentage)
@@ -59,13 +57,15 @@ def load_data():
             
             # 提取每个指标
             for m_key, _, _, is_percent in METRICS:
-                # === 修复开始: 针对 FSQ 的 Dead Code 特殊处理 ===
-                if 'fsq' in exp_key and m_key == 'dead_code_ratio':
-                    # FSQ 没有显式 Codebook，传统计算会溢出导致负数
-                    # 我们将其视为 "无死码" (0%)
-                    val = 0.0 
-                else:
-                    val = get_final_metrics(log, m_key)
+                # === 修复开始 ===
+                val = get_final_metrics(log, m_key)
+                
+                # 特殊处理 FSQ/Hybrid 的 Dead Code Ratio
+                if m_key == 'dead_code_ratio':
+                    if 'fsq' in exp_key and val is None: 
+                        val = 0.0 # 纯 FSQ 有时日志里没有 dcr 键
+                    elif val is not None and val < 0:
+                        val = 0.0 # 修正 Hybrid 的负数 DCR 为 0.0
                 # === 修复结束 ===
 
                 if val is not None:

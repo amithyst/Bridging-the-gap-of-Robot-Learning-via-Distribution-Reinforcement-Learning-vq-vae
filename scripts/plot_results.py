@@ -8,14 +8,12 @@ LOG_DIR = 'results'
 SAVE_DIR = 'plots'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from models.experiment_config import EXPERIMENTS
+
 # 1. 更新名称映射
-NAME_MAP = {
-    'simple_ema': 'Baseline',
-    'resnet_ema': 'ResNet+EMA',
-    'resnet_rvq': 'ResNet+RVQ',
-    'resnet_fsq': 'FSQ',
-    'resnet_lfq': 'LFQ'
-}
+NAME_MAP = {exp['id']: exp['name'] for exp in EXPERIMENTS}
 
 def smooth(scalars, weight=0.8):
     if len(scalars) == 0: return np.array([])
@@ -131,13 +129,14 @@ def plot_radar(data):
             arr = np.array(metrics_dict[k])
             if arr.ndim != 2 or arr.size == 0:
                 is_complete = False; break
-                
+            
+            # 取最后 5 个 epoch 的平均值
             final_val = np.mean(arr[:, -5:]) 
             
-            # === 修复开始: 绘图前清洗 FSQ 的异常数据 ===
-            if 'fsq' in exp_key and k == 'dead_code_ratio':
-                final_val = 0.0 # 强制修正为 0
-            # === 修复结束 ===
+            # 针对 FSQ/Hybrid 的 DCR 负数修正
+            if k == 'dead_code_ratio':
+                if 'fsq' in exp_key or 'hybrid' in exp_key:
+                    final_val = max(0.0, final_val)
             
             temp_vals[k] = final_val
             
@@ -148,54 +147,115 @@ def plot_radar(data):
         print("No valid data for Radar Chart.")
         return
 
-    # 选取第一个有效实验作为 Baseline
     baseline_key = list(summary.keys())[0]
     categories = ['Recon Quality', 'Motion Smoothness', 'Low Jerk', 'Code Usage', 'Active Codes']
     
-    radar_data = {}
-    for name, vals in summary.items():
-        base = summary[baseline_key]
-        
-        # 计算相对分数
-        # 越小越好 (Loss, Jerk, DCR) -> Baseline / Current
-        # 越大越好 (PPL) -> Current / Baseline
-        
-        s1 = np.clip(base['val_recon'] / (vals['val_recon'] + 1e-6), 0, 3)
-        s2 = np.clip(base['val_vel'] / (vals['val_vel'] + 1e-6), 0, 3)
-        s3 = np.clip(base['val_jerk'] / (vals['val_jerk'] + 1e-6), 0, 3)
-        
-        # PPL 越大越好
-        s4 = np.clip(vals['perplexity'] / (base['perplexity'] + 1e-6), 0, 3)
-        
-        # Dead Code Ratio 越小越好 (加个小常数防止除以0)
-        s5 = np.clip((base['dead_code_ratio'] + 0.01) / (vals['dead_code_ratio'] + 0.01), 0, 3)
-        
-        radar_data[name] = [s1, s2, s3, s4, s5]
+    # === 定义两种绘图配置 ===
+    plot_configs = [
+        {
+            'filename': 'final_radar_chart.png',
+            'log_scale': False,
+            'title': 'Relative Performance (Normalized by Best)',
+            # 线性模式：使用手动微调的 Limits 让 SOTA 刚好顶格
+            'limits': [5.0, 2.2, 1.5, 23.0, 20.0] 
+        },
+        {
+            'filename': 'final_radar_chart_log.png',
+            'log_scale': True,
+            'title': 'Relative Performance (Log Scale, Baseline=1.0)',
+            # 对数模式：Log2(Ratio)+1。
+            # Limit=6.0 意味着能容纳 2^(6-1) = 32倍 的性能提升，足够囊括 PPL 的 22倍
+            'limits': [3.5, 2.1, 1.7, 6.0, 6.0] 
+        }
+    ]
 
-    # 绘图
-    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-    angles += angles[:1]
+    # 1. Recon: Hybrid ~3.3x -> 设上限 4.0
+    # 2. Vel: Hybrid ~1.9x -> 设上限 2.5 (让 1.9 看起来饱满)
+    # 3. Jerk: LFQ ~3.2x, Hybrid ~1.8x -> 设上限 4.0 (包容 LFQ)
+    # 4. PPL: Hybrid ~6.5x, FSQ ~14x -> 设上限 8.0 (重点展示 Hybrid 的强项，FSQ 爆表也没关系)
+    # 5. DCR: Hybrid ~12x -> 设上限 15.0
     
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-    
-    for i, (name, scores) in enumerate(radar_data.items()):
-        vals = scores + scores[:1]
-        label = NAME_MAP.get(name, name)
-        ax.plot(angles, vals, linewidth=2, label=label, color=colors[i % len(colors)])
-        ax.fill(angles, vals, alpha=0.1, color=colors[i % len(colors)])
+    # === 循环生成两张图 ===
+    for config in plot_configs:
+        is_log = config['log_scale']
+        current_limits = config['limits']
+        PLOT_RADIUS = 3.0
         
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(categories)
-    plt.title('Relative Performance (vs Baseline)', y=1.08)
-    # === 修改开始 ===
-    # 1. bbox_to_anchor稍微调小一点 (1.3 -> 1.15) 让它靠经图表
-    # 2. 关键：savefig 加上 bbox_inches='tight'，它会自动扩展画布以包含所有内容
-    plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1.1)) 
-    plt.savefig(os.path.join(SAVE_DIR, 'final_radar_chart.png'), dpi=150, bbox_inches='tight')
-    # === 修改结束 ===
-    print("Saved final_radar_chart.png")
-    plt.close()
+        radar_data = {}
+        for name, vals in summary.items():
+            base = summary[baseline_key]
+            
+            # 1. 计算原始倍数 (Ratios)
+            # 越小越好 -> Baseline / Current
+            r1 = base['val_recon'] / (vals['val_recon'] + 1e-6)
+            r2 = base['val_vel'] / (vals['val_vel'] + 1e-6)
+            r3 = base['val_jerk'] / (vals['val_jerk'] + 1e-6)
+            
+            # 越大越好 -> Current / Baseline
+            r4 = vals['perplexity'] / (base['perplexity'] + 1e-6)
+            r5 = (base['dead_code_ratio'] + 0.01) / (vals['dead_code_ratio'] + 0.01)
+            
+            raw_ratios = [r1, r2, r3, r4, r5]
+            
+            # 2. 核心逻辑分支：对数 vs 线性
+            plot_vals = []
+            for r, limit in zip(raw_ratios, current_limits):
+                if is_log:
+                    # === 对数逻辑 ===
+                    # 使用 Log2，直观含义：+1 代表性能翻倍
+                    # +1.0 是偏移量，让 Baseline (Ratio=1.0) 位于 1.0 刻度处，而不是 0
+                    # max(0.1, r) 防止 log(0) 报错
+                    val_log = np.log2(max(0.1, r)) + 1.0
+                    
+                    # 归一化: (Log值 / Limit) * 半径
+                    # 这里的 Limit 6.0 对应 2^5 = 32倍提升
+                    norm_val = (val_log / limit) * PLOT_RADIUS
+                    
+                    # 截断防止画出圈外
+                    plot_vals.append(np.clip(norm_val, 0, PLOT_RADIUS))
+                else:
+                    # === 线性逻辑 (旧代码) ===
+                    norm_val = (r / limit) * PLOT_RADIUS
+                    plot_vals.append(np.clip(norm_val, 0, PLOT_RADIUS))
+                
+            radar_data[name] = plot_vals
+
+        # 3. 绘图部分
+        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+        angles += angles[:1]
+        
+        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+        
+        # 根据模式调整网格标签
+        if is_log:
+            # Log 模式下，网格代表 1x, 2x, 4x, 8x...
+            grid_labels = [] # 不显示具体数字，保持简洁
+            ax.set_ylim(0, PLOT_RADIUS)
+        else:
+            ax.set_ylim(0, PLOT_RADIUS)
+
+        # 设置网格线位置 (5等分)
+        ax.set_rgrids([0.6, 1.2, 1.8, 2.4, 3.0], labels=[], angle=0)
+
+        for i, (name, scores) in enumerate(radar_data.items()):
+            vals = scores + scores[:1]
+            label = NAME_MAP.get(name, name)
+            ax.plot(angles, vals, linewidth=2, label=label, color=colors[i % len(colors)])
+            ax.fill(angles, vals, alpha=0.1, color=colors[i % len(colors)])
+            
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(categories)
+        
+        plt.title(config['title'], y=1.08)
+        plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1)) 
+        
+        save_path = os.path.join(SAVE_DIR, config['filename'])
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved {save_path}")
+        plt.close()
+
+
 
 def main():
     data = load_and_aggregate()

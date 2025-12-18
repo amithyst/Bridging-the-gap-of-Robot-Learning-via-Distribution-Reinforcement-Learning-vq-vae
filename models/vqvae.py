@@ -193,6 +193,53 @@ class LFQ(nn.Module):
         
         return loss, out, metrics
 
+# === 1. 新增 HybridVQ 类 (放在 LFQ 类后面) ===
+# models/vqvae.py 中的 HybridVQ 类修改如下
+
+class HybridVQ(nn.Module):
+    """
+    Hybrid v2: FSQ (Base) + RVQ (Residual Refinement)
+    强力修补版：用多层 RVQ 来修补 FSQ 的残差，旨在同时获得高精度和较好的利用率。
+    """
+    def __init__(self, hidden_dim, fsq_levels=[8, 5, 5, 5], vq_codebook_size=1024):
+        super().__init__()
+        # 1. Base Layer: FSQ (负责大轮廓)
+        self.fsq = FSQ(levels=fsq_levels, input_dim=hidden_dim, hidden_dim=hidden_dim)
+        
+        # 2. Refinement Layer: RVQ (关键修改：用 RVQ 替代普通的 VQ)
+        # 使用 4 层 RVQ 来强力拟合残差，提升 Recon Quality
+        self.vq = ResidualVQ(
+            num_quantizers=4,           # 4层残差量化，对齐 ResNet+RVQ 的配置
+            num_embeddings=vq_codebook_size, 
+            embedding_dim=hidden_dim, 
+            commitment_cost=0.25, 
+            use_ema=True
+        )
+
+    def forward(self, z):
+        # Step 1: Base (FSQ)
+        _, z_fsq, metrics_fsq = self.fsq(z)
+        
+        # Step 2: Residual Calculation
+        residual = z - z_fsq
+        
+        # Step 3: Refine (RVQ)
+        # RVQ 的 forward 返回: loss, quantized, metrics
+        loss_vq, z_vq, metrics_vq = self.vq(residual)
+        
+        # Step 4: Combine
+        z_out = z_fsq + z_vq
+        
+        # Metrics: 综合汇报
+        # 我们希望看到 RVQ 帮助提升精度，同时 FSQ 保持高利用率
+        metrics = {
+            'perplexity': metrics_fsq['perplexity'],  # 主 PPL 看 FSQ
+            'dcr': metrics_fsq['dcr'],                # 主 DCR 看 FSQ
+            'rvq_ppl': metrics_vq['perplexity']       # 记录一下 RVQ 的利用率供参考
+        }
+        
+        return loss_vq, z_out, metrics
+    
 # ==========================================
 # 2. Building Blocks (Keep Unchanged)
 # ==========================================
@@ -300,17 +347,25 @@ class MotionVQVAE(nn.Module):
             self.quantizer = FSQ(levels=[4,4,4,4,4], input_dim=hidden_dim, hidden_dim=hidden_dim)
         elif method == 'lfq':
             self.quantizer = LFQ(input_dim=hidden_dim, codebook_dim=10)
+        elif method == 'hybrid': # <--- 新增的接口
+            self.quantizer = HybridVQ(hidden_dim=hidden_dim, fsq_levels=[8,5,5,5], vq_codebook_size=512)
         else:
             raise ValueError(f"Unknown quantization method: {method}")
         
         self.decoder = Decoder(input_dim, hidden_dim, arch=arch)
 
     def forward(self, x):
-        # x: [B, T, D] -> [B, D, T]
         x = x.permute(0, 2, 1)
         z = self.encoder(x)
-        # Change: Expect metrics dict
+        x_recon, loss_vq, metrics = self.quantizer(z) # 注意 Hybrid 返回顺序调整为一致: loss, z_out, metrics
+        # 如果上一步报错，请检查 HybridVQ 的 return 顺序是否为 loss, z_out, metrics
+        # 为了兼容上面的代码，这里稍微调整一下：
+        # 上面 HybridVQ.forward 返回的是: loss_vq, z_out, metrics
+        # 所以这里接收也是: loss_vq, z_q, metrics = self.quantizer(z)
+        
+        # 修正: 上面行是伪代码，实际执行:
         loss_vq, z_q, metrics = self.quantizer(z)
+
         x_recon = self.decoder(z_q)
         x_recon = x_recon.permute(0, 2, 1)
         return x_recon, loss_vq, metrics
