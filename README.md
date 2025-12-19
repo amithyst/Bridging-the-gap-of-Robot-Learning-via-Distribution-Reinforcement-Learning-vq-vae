@@ -29,7 +29,9 @@ project_root/
 │   │   ├── download_data.py           # ModelScope 数据下载脚本
 │   │   ├── inspect_npz.py             # 数据结构探查脚本
 │   │   └── process_data.py            # 数据清洗与切片脚本
-│   ├── deployment/            # [还没写] Isaac Lab 演示 (play_isaac)
+│   ├── deployment/            # Isaac Lab 演示 (play_isaac)
+│   │   ├── export_motion.py             # 数据输出格式转换
+│   │   └── play_g1_npy.py            # 使用isaaclab模拟
 │   ├── evaluation/            # 结果导出 (plot, export_latex)
 │   │   ├── plot_results.py            # 绘图脚本 (含方差带, Loss/PPL/Jerk/DCR/Radar(标准和对数))
 │   │   ├── analyze_latent_space.py # 可视化隐空间分布
