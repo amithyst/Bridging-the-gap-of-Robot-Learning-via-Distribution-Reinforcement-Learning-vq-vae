@@ -6,25 +6,31 @@ import torch.nn.functional as F
 import numpy as np
 import sys
 import os
-import time
 import json
 import random
-import concurrent.futures # <--- 新增
+import concurrent.futures
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models.vqvae import MotionVQVAE
+from models.vqvae import DualMotionVQVAE
 from models.experiment_config import EXPERIMENTS
 
-
-SEEDS = [42, 1024,999,2024,2025] # 减少为2个以快速演示，实际可用更多
-
+# === Config ===
+SEEDS = [42, 2025] 
 BATCH_SIZE = 256
-EPOCHS = 200
+EPOCHS = 400
 LEARNING_RATE = 2e-4
-INPUT_DIM = 29
 HIDDEN_DIM = 64
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+GPU_Work_Multipliers = 3
 LOG_DIR = 'results'
+CHECKPOINT_DIR = 'checkpoints'
+
+# === Loss Weights ===
+LAMBDA_RECON = 1.0
+LAMBDA_VQ    = 1.0
+LAMBDA_VEL   = 0.5
+LAMBDA_CROSS = 5.0   # 强迫 Human 输入能重构出 Robot 动作
+LAMBDA_ALIGN = 100.0  # 强迫 Latent Space 强制对齐
+TEMPERATURE = 0.07    # [新增] 用于 InfoNCE
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -33,210 +39,279 @@ def set_seed(seed):
     random.seed(seed)
 
 def calculate_jerk_loss(real, recon):
-    """
-    Jerk (加加速度) = d(Acc)/dt = d(d(Vel))/dt
-    Simple Finite Difference:
-    Vel = x[t+1] - x[t]
-    Acc = Vel[t+1] - Vel[t] = x[t+2] - 2x[t+1] + x[t]
-    Jerk = Acc[t+1] - Acc[t]
-    """
+    # (B, T, C)
     if real.shape[1] < 4: return torch.tensor(0.0).to(real.device)
-    
-    # 使用 torch.diff 计算高阶差分
-    # dim=1 is Time
     real_jerk = torch.diff(real, n=3, dim=1)
     recon_jerk = torch.diff(recon, n=3, dim=1)
-    
     return F.mse_loss(recon_jerk, real_jerk)
 
-def load_data():
-    data_path = os.path.join('data', 'processed', 'g1_train.npy')
-    if not os.path.exists(data_path):
-        # Fallback dummy data if file missing (for testing script logic)
-        print("Warning: .npy file not found, using dummy data.")
-        raw_data = np.random.randn(100, 64, 29).astype(np.float32)
-    else:
-        raw_data = np.load(data_path).astype(np.float32)
+def info_nce_loss(z_h, z_r, temperature=0.07):
+    # 对特征做 L2 归一化，将 MSE 转化为余弦相似度相关的对齐
+    z_h = F.normalize(z_h, dim=-1)
+    z_r = F.normalize(z_r, dim=-1)
+    
+    # 计算余弦相似度矩阵 (B, B)
+    logits = torch.matmul(z_h, z_r.T) / temperature
+    labels = torch.arange(z_h.size(0)).to(z_h.device)
+    
+    # 双向对比：Human 找 Robot，Robot 找 Human
+    loss_h = F.cross_entropy(logits, labels)
+    loss_r = F.cross_entropy(logits.T, labels)
+    return (loss_h + loss_r) / 2
 
-    dataset = TensorDataset(torch.from_numpy(raw_data))
+def load_paired_data():
+    p_root = os.path.join('data', 'processed')
+    r_path = os.path.join(p_root, 'g1_train.npy')
+    h_path = os.path.join(p_root, 'human_train.npy')
+    
+    if not os.path.exists(r_path) or not os.path.exists(h_path):
+        print("Error: 数据文件缺失，请先运行 process_data.py")
+        return None, None, 29, 63 
+
+    r_data = np.load(r_path).astype(np.float32)
+    h_data = np.load(h_path).astype(np.float32)
+    
+    min_n = min(len(r_data), len(h_data))
+    r_data = r_data[:min_n]
+    h_data = h_data[:min_n]
+    
+    robot_dim = r_data.shape[-1]
+    human_dim = h_data.shape[-1]
+    
+    dataset = TensorDataset(torch.from_numpy(r_data), torch.from_numpy(h_data))
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    return DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True), \
-           DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-# 替换 scripts/train_ablation.py 中的 train_seed 函数
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    
+    return DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True), \
+           DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False), \
+           robot_dim, human_dim
 
-def train_seed(config, seed, train_loader, val_loader, device): # <--- 修改这里
+def train_seed(config, seed, train_loader, val_loader, robot_dim, human_dim, device):
     set_seed(seed)
-
-    # print 改为包含设备信息，方便调试
     print(f"  > [Device: {device}] Seed {seed} | {config['name']}")
     
-    model = MotionVQVAE(
-        input_dim=INPUT_DIM, 
+    model = DualMotionVQVAE(
+        robot_input_dim=robot_dim,
+        human_input_dim=human_dim,
         hidden_dim=HIDDEN_DIM, 
         arch=config['arch'],
         method=config['method']
-    ).to(device) # <--- 修改这里，使用传入的 device
+    ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     
+    # === 修改：扩充 History 记录详细 Loss ===
     history = {
-        'train_loss': [], 'val_recon': [], 'val_vel': [], 
-        'val_jerk': [], 'perplexity': [], 'dead_code_ratio': []
+        'train_loss': [],
+        'train_recon_loss': [], # 新增
+        'train_cross_loss': [], # 新增
+        'train_align_loss': [], # 新增
+        'train_vq_loss': [],    # 新增
+        'train_vel_loss': [],   # 新增
+        'val_recon': [],      
+        'val_cross_recon': [], 
+        'val_align': [],        # 新增：验证集对齐损失
+        'val_vel': [], 
+        'val_jerk': [], 
+        'perplexity': [], 
+        'dead_code_ratio': []
     }
     
-    # === Early Stopping 初始化 ===
     best_val_loss = float('inf')
-    patience = 50         # 连续 10 轮不提升就停止
+    patience = 30
     patience_counter = 0
     
     for epoch in range(EPOCHS):
-        # Train
+        # --- Train ---
         model.train()
         t_loss = 0
+        # === 新增累加器 ===
+        t_recon_acc = 0
+        t_cross_acc = 0
+        t_align_acc = 0
+        t_vq_acc = 0    # 新增
+        t_vel_acc = 0   # 新增
+        
         for batch in train_loader:
-            x = batch[0].to(DEVICE)
+            x_r = batch[0].to(device)
+            x_h = batch[1].to(device)
+            
             optimizer.zero_grad()
-            x_recon, loss_vq, metrics = model(x)
+            outputs = model(x_robot=x_r, x_human=x_h)
             
-            loss_recon = F.mse_loss(x_recon, x)
-            loss_vel = F.mse_loss(x_recon[:,1:]-x_recon[:,:-1], x[:,1:]-x[:,:-1])
+            # Robot Self-Recon
+            out_r = outputs['robot']
+            loss_recon = F.mse_loss(out_r['recon'], x_r)
             
-            # Loss Function: 可以根据需要调整权重
-            loss = loss_recon + loss_vq + 0.5 * loss_vel
+            # Velocity Loss
+            loss_vel = F.mse_loss(out_r['recon'][:,1:]-out_r['recon'][:,:-1], x_r[:,1:]-x_r[:,:-1])
+            
+            # Alignment & Cross
+            z_e_r = out_r['z_e']
+            z_e_h = outputs['human']['z_e']
+            # 对时间维度取平均池化 (同 t-SNE 逻辑)，然后计算对比损失
+            z_e_r_pool = torch.mean(z_e_r, dim=2)
+            z_e_h_pool = torch.mean(z_e_h, dim=2)
+            
+            # 混合对齐：MSE (点) + InfoNCE (分布)
+            loss_align_mse = F.mse_loss(z_e_h, z_e_r)
+            loss_align_nce = info_nce_loss(z_e_h_pool, z_e_r_pool, temperature=TEMPERATURE)
+            loss_align = loss_align_mse + loss_align_nce
+            
+            loss_cross = F.mse_loss(outputs['human']['retargeted'], x_r)
+            
+            # VQ Losses
+            loss_vq = out_r['loss_vq'] + outputs['human']['loss_vq']
+            
+            # Total Loss (Updated with Config Constants)
+            loss = (LAMBDA_RECON * loss_recon + 
+                    LAMBDA_VQ    * loss_vq + 
+                    LAMBDA_VEL   * loss_vel + 
+                    LAMBDA_CROSS * loss_cross + 
+                    LAMBDA_ALIGN * loss_align)
+            
             loss.backward()
             optimizer.step()
+            
             t_loss += loss.item()
+            # === 累加分项 Loss ===
+            t_recon_acc += loss_recon.item()
+            t_cross_acc += loss_cross.item()
+            t_align_acc += loss_align.item()
+            t_vq_acc += loss_vq.item()    # 新增
+            t_vel_acc += loss_vel.item()  # 新增
         
-        # Val
+        # --- Validation ---
         model.eval()
-        v_recon = 0; v_vel = 0; v_jerk = 0; v_ppl = 0; v_dcr = 0
-        current_val_loss = 0 # 用于 Early Stopping
+        v_recon = 0; v_cross = 0; v_align = 0; # 新增 v_align
+        v_vel = 0; v_jerk = 0; v_ppl = 0; v_dcr = 0
         
         with torch.no_grad():
             for batch in val_loader:
-                x = batch[0].to(DEVICE)
-                x_recon, _, metrics = model(x)
+                x_r = batch[0].to(device)
+                x_h = batch[1].to(device)
                 
-                # 计算各项指标
-                recon_err = F.mse_loss(x_recon, x).item()
-                vel_err = F.mse_loss(x_recon[:,1:]-x_recon[:,:-1], x[:,1:]-x[:,:-1]).item()
+                outputs = model(x_robot=x_r, x_human=x_h)
+                x_recon = outputs['robot']['recon']
+                metrics = outputs['robot']['metrics'] 
                 
-                v_recon += recon_err
-                v_vel += vel_err
-                v_jerk += calculate_jerk_loss(x, x_recon).item()
+                # Metrics Calculation
+                v_recon += F.mse_loss(x_recon, x_r).item()
+                v_cross += F.mse_loss(outputs['human']['retargeted'], x_r).item()
+                
+                # === 新增：计算验证集 Alignment Loss ===
+                z_e_r = outputs['robot']['z_e']
+                z_e_h = outputs['human']['z_e']
+                v_align += F.mse_loss(z_e_h, z_e_r).item()
+                
+                v_vel += F.mse_loss(x_recon[:,1:]-x_recon[:,:-1], x_r[:,1:]-x_r[:,:-1]).item()
+                v_jerk += calculate_jerk_loss(x_r, x_recon).item()
                 v_ppl += metrics['perplexity'].item()
                 v_dcr += metrics['dcr'].item()
-                
-                # 验证集 Total Loss (用于判断是否停止)
-                current_val_loss += recon_err + 0.5 * vel_err
-
-        # Log
+        
         steps = len(val_loader)
-        history['train_loss'].append(t_loss / len(train_loader))
-        history['val_recon'].append(v_recon / steps)
+        avg_recon = v_recon / steps
+        
+        # Log History
+        train_steps = len(train_loader)
+        history['train_loss'].append(t_loss / train_steps)
+        history['train_recon_loss'].append(t_recon_acc / train_steps)
+        history['train_cross_loss'].append(t_cross_acc / train_steps)
+        history['train_align_loss'].append(t_align_acc / train_steps)
+        history['train_vq_loss'].append(t_vq_acc / train_steps)   # 新增
+        history['train_vel_loss'].append(t_vel_acc / train_steps) # 新增
+
+        history['val_recon'].append(avg_recon)
+        history['val_cross_recon'].append(v_cross / steps)
+        history['val_align'].append(v_align / steps) # 记录
         history['val_vel'].append(v_vel / steps)
         history['val_jerk'].append(v_jerk / steps)
         history['perplexity'].append(v_ppl / steps)
         history['dead_code_ratio'].append(v_dcr / steps)
-        
-        avg_val_loss = current_val_loss / steps
 
-        # === Early Stopping 逻辑 ===
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            patience_counter = 0 # 只要有提升，计数器归零
+        # Early Stopping
+        if avg_recon < best_val_loss:
+            best_val_loss = avg_recon
+            patience_counter = 0
         else:
             patience_counter += 1
             
-        # 打印简略进度条，方便观察谁停了
         if epoch % 10 == 0:
-            print(f"    Epoch {epoch}: Val Loss {avg_val_loss:.5f} | Patience {patience_counter}/{patience}")
-
+            print(f"    Ep {epoch}: Recon {avg_recon:.4f} | Align {v_align/steps:.4f} | PPL {v_ppl/steps:.1f}")
+            
         if patience_counter >= patience:
-            print(f"    [Stop] Early stopping at epoch {epoch} (Best Val Loss: {best_val_loss:.5f})")
-            break # 跳出 Epoch 循环
+            break
 
-    return history
+    return history, model
 
-# === 新增：单次任务包装器 (解决多进程数据加载问题) ===
 def run_task(args):
     config, seed, device_id = args
-
-    # === 新增：关键修改 ===
-    # 强制设定当前进程的默认 GPU，防止 CuDNN 算子去 cuda:0 找数据
     if torch.cuda.is_available() and device_id >= 0:
         torch.cuda.set_device(device_id)
-    # ====================
     device = f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu'
     
-    # 在子进程中重新加载数据，避免 Dataloader 多进程 pickle 问题
-    # 因为数据是 .npy 文件且很小，这样最稳妥
-    train_loader, val_loader = load_data()
+    train_loader, val_loader, r_dim, h_dim = load_paired_data()
+    if train_loader is None: return "Failed to load data"
     
     try:
-        history = train_seed(config, seed, train_loader, val_loader, device)
+        history, model = train_seed(config, seed, train_loader, val_loader, r_dim, h_dim, device)
         
-        # 保存日志
+        # Save Log
         log_file = os.path.join(LOG_DIR, f"log_{config['id']}_seed_{seed}.json")
         with open(log_file, 'w') as f:
             json.dump(history, f, indent=4)
+            
+        # Save Model
+        ckpt_name = f"{config['name']}_{config['method']}_seed_{seed}.pth"
+        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, ckpt_name))
+        
         return f"Success: {config['name']} (Seed {seed})"
     except Exception as e:
-        return f"Error in {config['name']} Seed {seed}: {e}"
+        import traceback
+        traceback.print_exc()
+        return f"Error in {config['name']}: {e}"
 
-# === 修改：主函数改为并行模式 ===
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
-    # 1. 自动检测 GPU
     num_gpus = torch.cuda.device_count()
-    if num_gpus == 0:
-        print("No GPU detected, using CPU (slow).")
-        device_ids = [-1] # -1 代表 CPU
-    else:
-        print(f"Detected {num_gpus} GPUs. Enabling parallel acceleration.")
-        device_ids = list(range(num_gpus))
+    device_ids = list(range(num_gpus)) if num_gpus > 0 else [-1]
+    MAX_WORKERS = max(1, num_gpus * GPU_Work_Multipliers)
     
-    # 2. 配置并行参数
-    # 建议：如果单卡，设置为 4 (看显存大小)；如果多卡，设置为 卡数 * 2
-    MAX_WORKERS = max(1, num_gpus * 2) if num_gpus > 0 else 2 
-    print(f"Parallel Workers: {MAX_WORKERS}")
-
-    # 3. 准备任务列表
     tasks = []
-    task_idx = 0
+    idx = 0
+    # 预加载一次检查数据
+    load_paired_data()
+    
     for config in EXPERIMENTS:
         for seed in SEEDS:
-            log_file = os.path.join(LOG_DIR, f"log_{config['id']}_seed_{seed}.json")
-            if os.path.exists(log_file):
-                print(f"Skipping {config['name']} (Seed {seed}) - Already exists.")
-                continue
+            # === 修改：如果旧日志缺少新字段，强制重新训练 ===
+            log_path = os.path.join(LOG_DIR, f"log_{config['id']}_seed_{seed}.json")
+            needs_run = True
+            if os.path.exists(log_path):
+                with open(log_path, 'r') as f:
+                    try:
+                        data = json.load(f)
+                        if 'val_align' in data: # 检查新字段是否存在
+                            needs_run = False
+                    except: pass
             
-            # Round-Robin 分配 GPU: 任务0->卡0, 任务1->卡1, 任务2->卡0...
-            target_device_id = device_ids[task_idx % len(device_ids)]
-            if num_gpus == 0: target_device_id = -1 # CPU 标志
+            if needs_run:
+                tasks.append((config, seed, device_ids[idx % len(device_ids)]))
+                idx += 1
             
-            tasks.append((config, seed, target_device_id))
-            task_idx += 1
+    print(f"Tasks: {len(tasks)}")
     
-    print(f"Total tasks to run: {len(tasks)}")
-
-    # 4. 启动进程池
-    # 设置启动方式为 spawn (Linux/Windows CUDA 必须)
     try:
         torch.multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
+    except RuntimeError: pass
+    
     with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # 提交所有任务
-        futures = [executor.submit(run_task, task) for task in tasks]
-        
-        # 监控完成进度
-        for future in concurrent.futures.as_completed(futures):
-            print(future.result())
+        futures = [executor.submit(run_task, t) for t in tasks]
+        for f in concurrent.futures.as_completed(futures):
+            print(f.result())
 
 if __name__ == "__main__":
     main()

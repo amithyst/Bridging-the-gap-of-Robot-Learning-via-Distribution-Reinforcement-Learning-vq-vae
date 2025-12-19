@@ -7,12 +7,12 @@
 # method: 传递给模型的 method 参数
 
 EXPERIMENTS = [
-    {'id': 'simple_ema',    'name': 'Baseline (Simple)',   'arch': 'simple', 'method': 'ema'},
+    {'id': 'simple_ema',    'name': 'Baseline(Simple)',   'arch': 'simple', 'method': 'ema'},
     {'id': 'resnet_ema',    'name': 'ResNet+EMA',          'arch': 'resnet', 'method': 'ema'},
     {'id': 'resnet_rvq',    'name': 'ResNet+RVQ',          'arch': 'resnet', 'method': 'rvq'},
     {'id': 'resnet_fsq',    'name': 'FSQ',                 'arch': 'resnet', 'method': 'fsq'},
     {'id': 'resnet_lfq',    'name': 'LFQ',                 'arch': 'resnet', 'method': 'lfq'},
     
     # === 这里是你新加的 ===
-    {'id': 'resnet_hybrid', 'name': 'Hybrid (FSQ+VQ)',     'arch': 'resnet', 'method': 'hybrid'},
+    {'id': 'resnet_hybrid', 'name': 'Ours(Dual-Enc+Hybrid)',     'arch': 'resnet', 'method': 'hybrid'},
 ]

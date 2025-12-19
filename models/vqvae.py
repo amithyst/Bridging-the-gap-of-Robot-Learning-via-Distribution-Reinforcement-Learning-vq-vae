@@ -324,18 +324,29 @@ class Decoder(nn.Module):
 
     def forward(self, x):
         return self.model(x)
-
 # ==========================================
-# 4. Main VQ-VAE Model
+# 4. Main Dual-Encoder VQ-VAE Model (Corrected for Paper)
 # ==========================================
 
-class MotionVQVAE(nn.Module):
-    def __init__(self, input_dim=29, hidden_dim=64, codebook_size=1024, 
-                 arch='resnet', method='ema', n_layers=4):
-        super(MotionVQVAE, self).__init__()
+class DualMotionVQVAE(nn.Module):
+    def __init__(self, 
+                 human_input_dim=263, # SMPL feature dim
+                 robot_input_dim=29,  # G1 Robot dim
+                 hidden_dim=64, 
+                 codebook_size=1024, 
+                 arch='resnet', 
+                 method='hybrid', 
+                 n_layers=4):
+        super(DualMotionVQVAE, self).__init__()
         
-        self.encoder = Encoder(input_dim, hidden_dim, arch=arch)
+        # --- Dual Encoders ---
+        # 1. Human Encoder: Maps SMPL features to Latent Space
+        self.human_encoder = Encoder(human_input_dim, hidden_dim, arch=arch)
         
+        # 2. Robot Encoder: Maps Robot joints to Latent Space
+        self.robot_encoder = Encoder(robot_input_dim, hidden_dim, arch=arch)
+        
+        # --- Shared Quantizer (The "Bridge") ---
         if method == 'standard':
             self.quantizer = VectorQuantizer(codebook_size, hidden_dim, use_ema=False)
         elif method == 'ema':
@@ -347,25 +358,61 @@ class MotionVQVAE(nn.Module):
             self.quantizer = FSQ(levels=[4,4,4,4,4], input_dim=hidden_dim, hidden_dim=hidden_dim)
         elif method == 'lfq':
             self.quantizer = LFQ(input_dim=hidden_dim, codebook_dim=10)
-        elif method == 'hybrid': # <--- 新增的接口
+        elif method == 'hybrid':
             self.quantizer = HybridVQ(hidden_dim=hidden_dim, fsq_levels=[8,5,5,5], vq_codebook_size=512)
         else:
             raise ValueError(f"Unknown quantization method: {method}")
         
-        self.decoder = Decoder(input_dim, hidden_dim, arch=arch)
+        # --- Robot Decoder Only (Per Paper Figure 1) ---
+        # 论文中主要关注从 Latent 解码回 Robot。
+        # 如果训练还需要重建 Human 以保证 encoder 质量，可以加 human_decoder，
+        # 但 Figure 1 强调的是 Robot Execution，通常我们希望 Latent 包含的信息足以重建 Robot 动作。
+        self.robot_decoder = Decoder(robot_input_dim, hidden_dim, arch=arch)
 
-    def forward(self, x):
-        x = x.permute(0, 2, 1)
-        z = self.encoder(x)
-        x_recon, loss_vq, metrics = self.quantizer(z) # 注意 Hybrid 返回顺序调整为一致: loss, z_out, metrics
-        # 如果上一步报错，请检查 HybridVQ 的 return 顺序是否为 loss, z_out, metrics
-        # 为了兼容上面的代码，这里稍微调整一下：
-        # 上面 HybridVQ.forward 返回的是: loss_vq, z_out, metrics
-        # 所以这里接收也是: loss_vq, z_q, metrics = self.quantizer(z)
+    def forward(self, x_robot=None, x_human=None):
+        """
+        支持三种模式：
+        1. 仅机器人训练: forward(x_robot=data)
+        2. 仅人类推理/生成: forward(x_human=data) -> decode to robot
+        3. 对齐训练 (Alignment): forward(x_robot=data, x_human=data)
+        """
+        outputs = {}
         
-        # 修正: 上面行是伪代码，实际执行:
-        loss_vq, z_q, metrics = self.quantizer(z)
+        # --- Branch 1: Robot Flow ---
+        if x_robot is not None:
+            x_robot = x_robot.permute(0, 2, 1) # [B, C, T]
+            z_e_robot = self.robot_encoder(x_robot)
+            
+            # Quantize
+            loss_vq_r, z_q_robot, metrics_r = self.quantizer(z_e_robot)
+            
+            # Decode (Reconstruction)
+            x_recon_robot = self.robot_decoder(z_q_robot)
+            outputs['robot'] = {
+                'recon': x_recon_robot.permute(0, 2, 1),
+                'loss_vq': loss_vq_r,
+                'metrics': metrics_r,
+                'z_e': z_e_robot # For alignment loss
+            }
 
-        x_recon = self.decoder(z_q)
-        x_recon = x_recon.permute(0, 2, 1)
-        return x_recon, loss_vq, metrics
+        # --- Branch 2: Human Flow ---
+        if x_human is not None:
+            x_human = x_human.permute(0, 2, 1) # [B, C, T]
+            z_e_human = self.human_encoder(x_human)
+            
+            # Quantize (Shared Codebook!)
+            # 注意：人类分支通常用于 inference 或 alignment training
+            loss_vq_h, z_q_human, metrics_h = self.quantizer(z_e_human)
+            
+            # Cross-Decoding: Human Latent -> Robot Body
+            # 这是论文核心：Implicit Retargeting
+            x_retargeted = self.robot_decoder(z_q_human)
+            
+            outputs['human'] = {
+                'retargeted': x_retargeted.permute(0, 2, 1),
+                'loss_vq': loss_vq_h,
+                'metrics': metrics_h,
+                'z_e': z_e_human # For alignment loss
+            }
+            
+        return outputs

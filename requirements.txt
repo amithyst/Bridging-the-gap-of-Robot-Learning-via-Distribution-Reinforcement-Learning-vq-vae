@@ -2,5 +2,4 @@ datasets
 matplotlib
 torch 
 pandas 
-pinocchio
 modelscope
