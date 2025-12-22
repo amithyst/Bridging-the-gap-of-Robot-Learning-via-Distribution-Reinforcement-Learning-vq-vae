@@ -16,6 +16,7 @@ project_root/
 │   │   ├── seulzx/smplx_datasets/ # .tar.bz2 文件存放处
 │   │   └── unzipped/              # 解压后的根目录
 │   └── processed/                 # 预处理后的 .npy 文件
+│       ├── g1_train_full_raw.npy # 完整长序列数据
 │       ├── g1_train.npy           # Shape: (N, 64, 29)
 │       ├── mean.npy               # 用于归一化
 │       └── std.npy                # 用于归一化
@@ -31,6 +32,7 @@ project_root/
 │   │   └── process_data.py            # 数据清洗与切片脚本
 │   ├── deployment/            # Isaac Lab 演示 (play_isaac)
 │   │   ├── export_motion.py             # 数据输出格式转换
+│   │   ├── render_viewport.py #[待修复]视角Bug
 │   │   └── play_g1_npy.py            # 使用isaaclab模拟
 │   ├── evaluation/            # 结果导出 (plot, export_latex)
 │   │   ├── plot_results.py            # 绘图脚本 (含方差带, Loss/PPL/Jerk/DCR/Radar(标准和对数))
@@ -41,13 +43,20 @@ project_root/
 │   ├── __init__.py
 │   └── alignment.py
 ├── plots/ #输出图片
-│   ├── compare_dcr.png
-│   ├── compare_jerk.png
-│   ├── compare_ppl.png
-│   ├── compare_recon.png
-│   ├── compare_vel.png
-│   ├── final_radar_chart_log.png
-│   └── final_radar_chart.png
+│   ├── latent_space/
+│   │   ├──...
+│   │   └── align_Baseline(Simple)_ema_seed_42.png
+│   ├── metrics/
+│   │   ├── compare_dcr.png
+│   │   ├── compare_jerk.png
+│   │   ├── compare_ppl.png
+│   │   ├── compare_recon.png
+│   │   ├── ...
+│   │   └── compare_vel.png
+│   ├── radar/
+│   │   ├── final_radar_chart_log.png
+│   │   ├── ...
+│   │   └── final_radar_chart.png
 ├── results/ #训练时记录的指标数据
 │   ├── log_resnet_ema_seed_1024.json
 │   ├── ...
@@ -105,12 +114,12 @@ install -e .
 ### 2.2 Standard Workflow
 按顺序执行以下指令即可完成从数据准备到结果导出的全流程：
 
-1. **Data Download:**
+#### 1. **Data Download:**
 ```bash
-   python scripts/data/download_data.py
+   python scripts/download_data.py
 ```
 
-2. **Unzip Data:**
+#### 2. **Unzip Data:**
    (需手动解压至指定目录)
 ```bash
    mkdir -p ./data/raw/unzipped
@@ -118,40 +127,119 @@ install -e .
    tar -xjf ./data/raw/seulzx/smplx_datasets/extended_datasets.tar.bz2 -C ./data/raw/unzipped
 ```
 
-3. **Data Inspection (Optional):**
+#### 3. **Data Inspection (Optional):**
 ```bash
    python scripts/data/inspect_npz.py
 ```
 
-4. **Preprocessing:**
+#### 4. **Preprocessing:**
 ```bash
-   python scripts/data/process_data.py
+# 生成包含完整长序列的数据集
+# --overwrite 是必须的，否则它会发现 output_dir 有文件而跳过
+python scripts/data/process_data.py \
+    --input_dir "./data/raw/unzipped/extended_datasets/lafan1_dataset/g1" \
+    --output_dir "./data/processed" \
+    --window 10 \
+    --step 1\
+    --overwrite
 ```
 
-5. **Training (Multi-Seed Ablation):**
+#### 5. **Training (Multi-Seed Ablation):**
+
+##### 大架构
 ```bash
-   python scripts/train_ablation.py
+python scripts/train_ablation.py \
+    --mode teacher \
+    --arch transformer \
+    --method hybrid \
+    --window 10 \
+    --epochs 500 \
+    --patience 50 \
+    --batch_size 512 \
+    --resume
+
+python scripts/train_ablation.py \
+    --mode student \
+    --arch transformer \
+    --method hybrid \
+    --window 10 \
+    --epochs 1000 \
+    --patience 50 \
+    --batch_size 1024 \
+    --teacher_ckpt "checkpoints/Exp_transformer_W10_hybrid_teacher_seed_42_best.pth" \
+    --resume
+
+```
+##### 小架构
+
+```bash
+python scripts/train_ablation.py \
+    --mode teacher \
+    --arch resnet_no_down \
+    --method ae \
+    --window 10 \
+    --epochs 500 \
+    --batch_size 4096 \
+    --patience 20 \
+    --seed 42 1024
+
+python scripts/train_ablation.py \
+    --mode student \
+    --arch resnet_no_down \
+    --method ae \
+    --window 10 \
+    --epochs 500 \
+    --batch_size 4096 \
+    --patience 20 \
+    --teacher_ckpt "checkpoints/Exp_resnet_no_down_W10_ae_teacher_seed_42_best.pth" \
+    --seed 42 1024
 ```
 
-6. **Result Export & Visualization:**
+#### 6. **Result Export & Visualization:**
 ```bash
-   python scripts/evaluation/export_latex_table.py
-   python scripts/evaluation/plot_results.py
-   python scripts/evaluation/analyze_latent_space.py
+python scripts/evaluation/export_latex_table.py
+# 1. 绘制训练曲线 (Loss, Recon, Align, DCR 等)
+# 现在的实验名称通常包含 "transformer" 或 "Ours"，建议用 filter 筛选
+python scripts/evaluation/plot_results.py --dir results --filter transformer
+
+# 2. 隐空间可视化 (t-SNE)
+# !!! 关键变化：--window 必须设为 64，否则数据加载形状对不上模型
+python scripts/evaluation/analyze_latent_space.py --window 10 --filter student
 ```
-7. 启动isaaclab
+
+
+
+#### 7. **启动isaaclab可视化转换数据**
 ```bash
 # 确保在项目根目录下执行，这样脚本才能找到 models 文件夹
 cd /home/kaijie/深度学习/PJ_vqvae
 conda activate isaaclab_env
 # 使用 isaaclab.sh 运行脚本，-p 参数代表用内置 python 运行
+# 即使 custom_ae 不在 EXPERIMENTS 里，指定 --method ae 也能跑
+# 从第 1000 个样本开始，连续导出 20 个
+# 导出 Robot 重构动作 (用于测试 VQ-VAE 的还原能力)
 python scripts/deployment/export_motion.py \
-    --exp_id resnet_hybrid \
-    --ckpt "checkpoints/Ours(Dual-Enc+Hybrid)_hybrid_seed_42.pth" \
-    --data_dir "./data/processed" \
-    --output_dir "./motions" \
-    --sample_idx 0
+    --ckpt "checkpoints/Exp_transformer_W10_hybrid_teacher_seed_42_best.pth" \
+    --arch transformer \
+    --method hybrid \
+    --window 10 \
+    --start_idx 0 \
+    --num_samples 1 \
+    --step_size 5 \
+    --max_len 600
 
+# 纯AE
+python scripts/deployment/export_motion.py \
+    --ckpt "checkpoints/Exp_resnet_no_down_W10_ae_teacher_seed_42_best.pth" \
+    --arch resnet_no_down \
+    --method ae \
+    --window 10 \
+    --start_idx 0 \
+    --num_samples 1 \
+    --step_size 5 \
+    --max_len 600
+
+# [可不用]显示多帧动画
 python scripts/deployment/play_g1_npy.py \
     --input_file "motions/demo_recon_resnet_hybrid_idx0.npy" \
     --input_fps 30 \
@@ -159,167 +247,98 @@ python scripts/deployment/play_g1_npy.py \
 
 ```
 
+#### 8.逐帧可视化
 
+```bash
+# 渲染原始数据
+python scripts/deployment/render_viewport.py --input_file "motions/idx0_gt.npy"
 
+# 渲染重构数据 (请根据您实际生成的 npy 文件名修改路径)
+python scripts/deployment/render_viewport.py --input_file "motions/recon_transformer_FullSeq_W10_idx0.npy"
 
-## 3. Dataset Specifications (I/O Protocols)
+python scripts/deployment/render_viewport.py --input_file "motions/recon_resnet_no_down_FullSeq_W10_idx0.npy"
 
-### 3.1 Raw Data Source
-- **Source:** ModelScope (`seulzx/smplx_datasets`)
-- **Structure Path:** `data/raw/unzipped/extended_datasets/lafan1_dataset/g1`
-- **File Format:** `.npz` (Numpy Archive)
-- **Key Discovery:**
-  在 `inspect_npz.py` 探查中发现数据集已包含重定向好的机器人数据。
-  - **Selected Key:** `joint_pos` (机器人关节角度)
-  - **Robot:** Unitree G1
-  - **DoF (Degrees of Freedom):** 29
-  - **Ignored Keys:** `fps`, `joint_vel`, `body_pos_w`, `smplx_pose_body` (原始SMPL数据), `robot_keypoints_trans` 等。
+```
+或者
+```bash
+# 渲染原始数据
+python scripts/deployment/render_viewport.py --max_shots 50 --input_file "motions/idx0_gt.npy" "motions/recon_transformer_FullSeq_W10_idx0.npy"
+```
 
-### 3.2 Preprocessed Data (.npy) (Updated)
-预处理脚本 `process_data.py` 已更新，强制将数据 Flatten 为 3D 张量 `(N, T, C)` 以解决 DataLoader 维度报错问题，并生成成对数据。
+## 5. System Architecture: Transformer-based VQ-VAE (Teacher-Student)
 
-- **Robot Data:**
-  - `g1_train.npy`: Shape `(N, 64, 29)` - Unitree G1 关节数据。
-  - `mean.npy` / `std.npy`: 机器人数据的归一化统计量。
-- **Human Data (Paired):**
-  - `human_train.npy`: Shape `(N, 64, 126)` - 对应的 SMPL 姿态数据 (Flattened from 21x6 or similar)。
-  - `human_mean.npy` / `human_std.npy`: 人类数据的归一化统计量。
-- **Normalization:** 双边独立归一化 (Dual-side Independent Normalization)。
-
-## 4. Development Log & Execution History
-
-### 4.1 Environment Setup
-安装了 ModelScope, Torch, Pinocchio (未实际使用但已装), Datasets 库。
-> pip install modelscope torch pandas pinocchio datasets
-
-### 4.2 Data Acquisition
-运行 `scripts/download_data.py`。
-- **Issue:** 初始报错 `Repo not exists`。
-- **Fix:** 在 `snapshot_download` 中添加参数 `repo_type='dataset'`。
-- **Result:** 成功下载 `extended_datasets.tar.bz2` (1.2GB) 和 `lafan1_smplx_datasets.tar.bz2` (834M)。
-
-### 4.3 Data Inspection & Logic Pivot
-**Critical Step:** 运行 `scripts/inspect_npz.py` 检查数据内部。
-- **Input:** 检查了 `.../g1/train/dance1_subject2.npz`
-- **Output Keys:** `['fps', 'joint_pos', 'joint_vel', ..., 'smplx_pose_body', ...]`
-- **Decision:** 发现数据集中已包含名为 `g1` (Unitree G1) 的机器人 `joint_pos` 数据。
-- **Action:** **取消** 原定的 Inverse Kinematics (IK) 和 Retargeting 开发计划，直接使用现成的 `joint_pos` 进行 VQ-VAE 训练。
-
-### 4.4 Data Preprocessing
-运行 `scripts/process_data.py`。
-- **Version 1 Issue:** 简单提取并将数据存为 `object` 数组，无法被 DataLoader 直接使用。
-- **Version 2 Fix:** 引入滑动窗口 (Sliding Window) 机制。
-- **Execution Log (2025-12-17):**
-  > 在 ./data/raw/unzipped/extended_datasets/lafan1_dataset/g1 下发现了子目录: ['train']
-  > 正在处理 train 集 (来源: ['train'])...
-  > Loading train: 100%|...| 40/40 [00:00<00:00, 400.56it/s]
-  > --> train 完成。Shape: (13726, 64, 29) (Samples, Time, Dof)
-  > 警告: 没有找到 test 相关的文件夹，跳过。
-  > 正在计算归一化统计量 (Mean/Std)...
-  > Mean/Std 已保存。数据预处理全部完成！
-
-## 5. System Architecture: Dual-Encoder Shared-Space VQ-VAE
-
-本项目采用 **Dual-Encoder (双编码器)** 架构来实现 Implicit Retargeting，核心思想是强迫人类和机器人的动作在量化潜在空间（Quantized Latent Space）中对齐。
+本项目采用 **Transformer** 架构配合 **Teacher-Student (两阶段)** 训练策略。核心改进在于将时序动作（Window Size，默认 10 帧）压缩为潜在空间中的 **唯一 Token (Global Latent Token)**，从而实现基于意图的强对齐。
 
 ### 5.1 Module Definitions
-1.  **Robot Encoder ($E_r$):** - Input: $x_r \in \mathbb{R}^{T \times 29}$
-    - Output: $z_{e,r}$
-2.  **Human Encoder ($E_h$):** - Input: $x_h \in \mathbb{R}^{T \times 126}$
-    - Output: $z_{e,h}$ (通过卷积层映射到与 $E_r$ 相同的隐层维度)
-3.  **Shared Quantizer ($Q$):** - Method: **HybridVQ (FSQ + RVQ)**
-    - Role: "The Bridge". 无论输入来源如何，都将其离散化为共享的 Codebook 索引。
-4.  **Robot Decoder ($D_r$):** - Input: $z_q$ (Quantized Latent)
-    - Output: $\hat{x}_r \in \mathbb{R}^{T \times 29}$ (始终生成机器人动作)
+1.  **Transformer Encoder ($E$):**
+    -   **Structure:** `Linear` -> `Transformer Encoder (Global Attention)` -> `Global Mean Pooling` -> `Linear`
+    -   **Input Data Dimensions:**
+        -   **Robot ($x_r$):** $\mathbb{R}^{10 \times 29}$ (29 DoF Joint Positions)
+        -   **Human ($x_h$):** $\mathbb{R}^{10 \times 126}$ (SMPL-X Body Pose: 21 Joints $\times$ 6D Rotation)
+    -   **Output:** $z_e \in \mathbb{R}^{1 \times 64}$ (Single Token representing the whole motion sequence)
+    -   **Mechanism:** 利用 Transformer 的全局注意力机制捕捉窗口内的完整运动意图。
+
+2.  **Shared Quantizer ($Q$):**
+    -   **Method:** **HybridVQ (FSQ + RVQ)**
+    -   **Role:** 将连续的意图 Token $z_e$ 离散化为 Codebook 索引。
+
+3.  **Transformer Decoder ($D_r$):**
+    -   **Input:** $z_q \in \mathbb{R}^{1 \times 64}$
+    -   **Mechanism:** `Repeat(10)` -> `Positional Encoding` -> `Transformer Encoder`
+    -   **Output:** $\hat{x}_r \in \mathbb{R}^{10 \times 29}$ (一次性生成完整序列)
 
 ### 5.2 Inference Flow (Retargeting)
-推理时仅使用 Human Encoder 和 Robot Decoder：
-$$\text{Human Input } x_h \xrightarrow{E_h} z_{e,h} \xrightarrow{Q} z_q \xrightarrow{D_r} \text{Robot Motion } \hat{x}_r$$
+推理时使用训练好的 Human Encoder (Student) 和冻结的 Robot Decoder (Teacher)：
+$$\text{Human Input } x_h (10\text{ frames}) \xrightarrow{E_h} \text{Token } z_{e,h} \xrightarrow{Q} z_q \xrightarrow{D_r} \text{Robot Motion } \hat{x}_r$$
 
-## 6. Workflow (Updated for Alignment)
+## 6. Workflow (Teacher-Student Strategy)
 
-
+为了解决“域分离”问题，本项目放弃了不稳定的同步对抗训练，转而采用 **Teacher-Student 两阶段训练法**。
 
 ### 6.1 Training Strategy
 
-训练时同时输入成对的 $(x_r, x_h)$：
-1.  **Robot Flow (Self-Recon):** $x_r \to E_r \to Q \to D_r \to \hat{x}_r$
-2.  **Human Flow (Cross-Recon):** $x_h \to E_h \to Q \to D_r \to \hat{x}_{cross}$
-3.  **Alignment Constraint:** $z_{e,r} \approx z_{e,h}$
+**Stage 1: Teacher Training (Robot VQ-VAE)**
+-   **目标:** 建立完美的机器人动作“字典” (Codebook) 和重构能力。
+-   **输入:** 仅机器人数据 $x_r$。
+-   **模型:** 训练 $E_r, Q, D_r$。
+-   **产出:** 训练完成后**冻结 (Freeze)** 所有参数。
 
-### 6.2 Evaluation Metrics (Updated)
+**Stage 2: Student Alignment (Human-to-Robot)**
+-   **目标:** 训练 Human Encoder 将人类动作映射到已经冻结的 Robot 潜在空间中。
+-   **输入:** 成对数据 $(x_r, x_h)$。
+-   **模型:** 仅训练 $E_h$ (Student)。$E_r$ 仅作为目标生成器 (Target Generator)。
+-   **约束:** $z_{e,h} \approx z_{e,r}$ (Direct MSE)。
 
-本项目使用以下 8 个核心指标评估模型性能。
+### 6.2 Loss Function Configuration (Updated)
 
-#### 指标用途分类说明：
-* **[LOSS]**: 该指标直接参与损失函数计算，用于模型优化。
-* **[雷达图]**: 该指标出现在 `final_radar_chart.png` 中，用于模型间的综合性能对比。
-* **[曲线]**: 该指标在 `results/*.json` 中记录，并生成对应的 `compare_*.png` 训练趋势图。
+根据训练阶段不同，损失函数分为两套：
 
-#### 指标详表：
+**Stage 1 (Teacher):**
+$$\mathcal{L}_{Teacher} = \lambda_{recon} \mathcal{L}_{recon} + \lambda_{vq} \mathcal{L}_{vq} + \lambda_{vel} \mathcal{L}_{vel}$$
+* 重点关注机器人的物理动作还原与平滑度。
 
-1.  **Reconstruction Loss (MSE): [LOSS] [雷达图] [曲线]**
-    * 衡量机器人自身重建动作的精确度。
-2.  **Cross-Reconstruction Loss (Retargeting Error): [LOSS] [雷达图] [曲线]**
-    * 衡量 Human -> Robot 转换后与 Ground Truth 的差异。
-3.  **Alignment Loss (Latent MSE + InfoNCE): [LOSS] [雷达图] [曲线]**
-    * 衡量 $z_{human}$ 和 $z_{robot}$ 在潜在空间中的重叠程度。
-4.  **Velocity Loss: [LOSS] [雷达图] [曲线]**
-    * 衡量动作一阶导数的一致性，确保动态特性。
-5.  **VQ Loss (Commitment): [LOSS] [曲线]**
-    * 衡量编码器输出靠近 Codebook 中心的程度（不计入雷达图以保持视觉平衡）。
-6.  **Jerk Loss (Smoothness): [雷达图] [曲线]**
-    * 衡量加加速度，评估生成的机械臂动作是否平滑、无抖动（不参与训练）。
-7.  **Perplexity (PPL): [雷达图] [曲线]**
-    * 衡量 Codebook 条目的活跃利用率。
-8.  **Dead Code Ratio (DCR): [曲线]**
-    * 衡量未被激活的条目比例（已从雷达图移除，仅作为训练诊断参考）。
+**Stage 2 (Student):**
+$$\mathcal{L}_{Student} = \lambda_{align} \| z_{e,human} - z_{e,robot} \|^2_2$$
+* **Token-level Alignment:** 由于潜在空间已被压缩为 1 个 Token，直接计算 MSE 即可实现强对齐，不再需要 InfoNCE 或时间维度的平均池化。
 
-#### 6.3 Loss Function Configuration (Updated)
+### 6.3 Visualization Analysis (Updated)
 
-模型训练的总损失函数由以下 5 部分加权组成，旨在实现精确重建与跨域对齐的平衡：
+由于现在的模型架构直接输出单个隐变量 Token ($T=1$)：
+1.  **无需 Temporal Pooling:** 代码中的可视化脚本不再需要手动对时间维度取平均。
+2.  **t-SNE 含义:** 图上的每一个点直接代表一个**完整的 64 帧动作片段**。
+3.  **对齐判据:** 在 Stage 2 训练良好的情况下，Human 和 Robot 的点在 t-SNE 图中应完全重合。
 
-$$\mathcal{L}_{total} = \lambda_{recon} \mathcal{L}_{recon} + \lambda_{vq} \mathcal{L}_{vq} + \lambda_{vel} \mathcal{L}_{vel} + \lambda_{cross} \mathcal{L}_{cross} + \lambda_{align} \mathcal{L}_{align}$$
+## 7. Experimental Results (Transformer Era)
 
-* **权重优化记录**: 为了解决 t-SNE 分离问题，$\lambda_{align}$ 已提升至 **100.0**，且引入了 **InfoNCE 对比损失**。
-* **可视化监控**: `loss_breakdown.png` 现在支持全部 5 路损失的均值与方差带（Mean ± Std）展示。
+**Update:** 转入 Transformer + Teacher-Student 架构后的最新实验数据 (Running...)。
 
-### 6.4 Visualization Workflow & Analysis
+### Current SOTA Configuration
+-   **Architecture:** Transformer (4 Layers, d_model=64)
+-   **Latent:** Single Token Compression (10 frames -> 1 frame)
+-   **Quantizer:** Hybrid (FSQ + RVQ)
+-   **Training:** Teacher-Student Two-Stage
 
-为了验证 Human-to-Robot 的 Implicit Retargeting 效果，本项目建立了标准化的可视化分析流程 (`scripts/analyze_latent_space.py`)：
-
-1.  **Data Loading & Normalization:**
-    -   加载成对的 Human/Robot 动作数据。
-    -   **关键步骤:** 执行双边独立归一化 (`(x - mean) / std`)，确保两个域的数据在进入编码器前处于同一尺度，消除数值分布差异导致的伪分离。
-2.  **Feature Extraction (Continuous Latent):**
-    -   提取量化前的潜变量 $z_e$ (Encoder Output)，而非量化后的 $z_q$。
-    -   **原因:** $z_e$ 代表了编码器的原始映射能力，观察 $z_e$ 的分布重叠程度能直接反映 Alignment Loss 是否生效。
-3.  **Temporal Pooling:**
-    -   对时间维度进行平均池化 (Mean Pooling)，将一段时间序列动作压缩为潜在空间中的一个点。
-4.  **Dimensionality Reduction (t-SNE):**
-    -   将高维特征 ($D=64$) 降维至 2D 平面。
-    -   **判据:**
-        -   **Color by Action:** 不同动作（Run vs Walk）应形成自然聚类。
-        -   **Color by Domain:** Robot 和 Human 的数据点应当**完全重叠 (Overlap)**。若泾渭分明，则说明 Domain Gap 依然存在。
-
-### 6.5 下阶段进行任务[待办]
-
-1. Isaac Lab 同屏演示 (Deployment):
-   - 编写 scripts/deployment/play_isaac.py。
-   - 实现“人类(Marker) - 机器人(GT) - 机器人(Model)”三位一体同屏回放。
-2. 路径适配稳健化:
-   - 将所有脚本的 sys.path 修改为溯源至 project_root 的 Path.parents[2] 写法。
-3. 模型验证:
-   - 重新运行训练，观察 λ_align=100 后 t-SNE 是否实现红蓝点重叠。
-
-## 7. Final Experimental Results (SOTA Performance)
-
-经过多轮消融实验与架构迭代，我们提出的 **Hybrid (FSQ+VQ)** 模型被确认为本项目的最终 SOTA 模型。
-
--   **性能评估:** 该模型成功克服了 RVQ 的抖动问题和 FSQ 的精度瓶颈，被称为“五边形战士”：
-    -   **精度:** Reconstruction Loss (**0.0081**) 和 Velocity Loss (**0.0006**) 均为全场最低，显著优于单纯的 RVQ (0.0097)。
-    -   **利用率:** PPL 高达 1670.3，有效利用了潜在空间。
-    -   **平滑度:** Jerk Loss (**0.0022**) 极低，仅次于甚至逼近以牺牲精度为代价的 LFQ (0.0020)，远优于 Baseline 和单纯 RVQ。
+*(待训练完成后填入新表格)*
 -   **LaTeX 表格:** 以下是最终导出的实验数据表格，已格式化为 LaTeX 代码：
 
 ```latex
