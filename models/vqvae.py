@@ -239,7 +239,25 @@ class HybridVQ(nn.Module):
         }
         
         return loss_vq, z_out, metrics
+
+class IdentityVQ(nn.Module):
+    """
+    AE Mode: No Quantization. Just pass through.
+    Used for debugging reconstruction capability.
+    """
+    def __init__(self):
+        super().__init__()
     
+    def forward(self, z):
+        # z: [Batch, Channel, Time]
+        # Loss is 0, Metrics are dummy values
+        loss = torch.tensor(0.0, device=z.device)
+        metrics = {
+            'perplexity': torch.tensor(1.0, device=z.device),
+            'dcr': torch.tensor(0.0, device=z.device)
+        }
+        return loss, z, metrics
+
 # ==========================================
 # 2. Building Blocks (Keep Unchanged)
 # ==========================================
@@ -273,7 +291,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :, :x.size(2)]
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, arch='simple'):
+    def __init__(self, input_dim, hidden_dim, arch='simple', num_res_layers=4): # <--- 新增参数
         super().__init__()
         self.arch = arch
         if arch == 'simple':
@@ -282,13 +300,22 @@ class Encoder(nn.Module):
                 nn.Conv1d(hidden_dim, hidden_dim, 4, 2, 1), nn.LeakyReLU(0.2),
             )
         elif arch == 'resnet':
-            self.model = nn.Sequential(
-                nn.Conv1d(input_dim, hidden_dim, 4, 2, 1), nn.LeakyReLU(0.2),
-                ResBlock1D(hidden_dim),
-                nn.Conv1d(hidden_dim, hidden_dim, 4, 2, 1), nn.LeakyReLU(0.2),
-                ResBlock1D(hidden_dim),
-                ResBlock1D(hidden_dim),
-            )
+            # === 修改开始：动态层数 ===
+            layers = [
+                nn.Conv1d(input_dim, hidden_dim, 4, 2, 1), 
+                nn.LeakyReLU(0.2),
+            ]
+            # 循环添加 ResBlock
+            for _ in range(num_res_layers):
+                layers.append(ResBlock1D(hidden_dim))
+                
+            layers.extend([
+                nn.Conv1d(hidden_dim, hidden_dim, 4, 2, 1), 
+                nn.LeakyReLU(0.2),
+                ResBlock1D(hidden_dim), # 最后一层保留做特征整理
+            ])
+            self.model = nn.Sequential(*layers)
+            # === 修改结束 ===
         else: # Transformer placeholder for brevity, assume implemented as before
              self.model = nn.Sequential(
                 nn.Conv1d(input_dim, hidden_dim, 4, 2, 1), nn.LeakyReLU(0.2),
@@ -298,7 +325,7 @@ class Encoder(nn.Module):
         return self.model(x)
 
 class Decoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, arch='simple'):
+    def __init__(self, input_dim, hidden_dim, arch='simple', num_res_layers=4): # <--- 新增参数
         super().__init__()
         self.arch = arch
         if arch == 'simple':
@@ -307,15 +334,27 @@ class Decoder(nn.Module):
                 nn.ConvTranspose1d(hidden_dim, input_dim, 4, 2, 1),
             )
         elif arch == 'resnet':
-            self.model = nn.Sequential(
-                ResBlock1D(hidden_dim),
-                ResBlock1D(hidden_dim),
+            # === 修改开始：动态层数 ===
+            layers = []
+            # 对称：先加 ResBlocks
+            for _ in range(num_res_layers):
+                layers.append(ResBlock1D(hidden_dim))
+            
+            layers.extend([
                 nn.Upsample(scale_factor=2.0, mode='nearest'),
-                nn.Conv1d(hidden_dim, hidden_dim, 3, 1, 1), nn.LeakyReLU(0.2),
-                ResBlock1D(hidden_dim),
+                nn.Conv1d(hidden_dim, hidden_dim, 3, 1, 1), 
+                nn.LeakyReLU(0.2),
+            ])
+            
+            # 再加一层 ResBlock 过渡
+            layers.append(ResBlock1D(hidden_dim))
+            
+            layers.extend([
                 nn.Upsample(scale_factor=2.0, mode='nearest'),
                 nn.Conv1d(hidden_dim, input_dim, 3, 1, 1),
-            )
+            ])
+            self.model = nn.Sequential(*layers)
+            # === 修改结束 ===
         else:
             self.model = nn.Sequential(
                 nn.ConvTranspose1d(hidden_dim, hidden_dim, 4, 2, 1), nn.LeakyReLU(0.2),
@@ -324,29 +363,180 @@ class Decoder(nn.Module):
 
     def forward(self, x):
         return self.model(x)
+    
+
+# models/vqvae.py
+
+class NoDownsampleEncoder(nn.Module):
+    """
+    全分辨率 ResNet Encoder: 始终保持 stride=1，不进行下采样。
+    输入: [B, C, T] -> 输出: [B, Hidden, T]
+    """
+    def __init__(self, input_dim, hidden_dim, num_res_layers=4):
+        super().__init__()
+        # 1. 初始投影 (保持 T 不变)
+        self.model = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        # 2. 堆叠 ResBlock (保持 T 不变)
+        for _ in range(num_res_layers):
+            self.model.add_module(f"res_{_}", ResBlock1D(hidden_dim))
+            
+        # 3. 最终整理
+        self.model.add_module("final_conv", nn.Conv1d(hidden_dim, hidden_dim, 3, 1, 1))
+        self.model.add_module("final_act", nn.LeakyReLU(0.2, inplace=True))
+
+    def forward(self, x):
+        return self.model(x)
+
+class NoDownsampleDecoder(nn.Module):
+    """
+    全分辨率 ResNet Decoder: 始终保持 stride=1。
+    输入: [B, Hidden, T] -> 输出: [B, Output_Dim, T]
+    """
+    def __init__(self, output_dim, hidden_dim, num_res_layers=4):
+        super().__init__()
+        self.model = nn.Sequential()
+        
+        # 1. 堆叠 ResBlock
+        for i in range(num_res_layers):
+            self.model.add_module(f"res_{i}", ResBlock1D(hidden_dim))
+            
+        # 2. 输出层
+        self.model.add_module("out_conv", nn.Conv1d(hidden_dim, output_dim, kernel_size=3, stride=1, padding=1))
+
+    def forward(self, x):
+        return self.model(x)
+    
+class TransformerPositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0)) # Shape: (1, T, C)
+
+    def forward(self, x):
+        # x shape: (Batch, Time, Dim)
+        return x + self.pe[:, :x.size(1), :]
+
+
+
+
+class TransformerMotionEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, d_model=256, nhead=4, num_layers=4):
+        super().__init__()
+        # 1. Input Projection (不降采样，保留64帧)
+        self.input_proj = nn.Linear(input_dim, d_model)
+        
+        # 2. Transformer Backbone
+        self.pe = TransformerPositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=512, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 3. Aggregation (64 Tokens -> 1 Token)
+        # 我们使用一个 Learnable 的 query 或者简单的 Mean Pooling
+        # 这里为了保留全量信息压缩，使用 Mean Pooling + Projection
+        self.output_proj = nn.Linear(d_model, hidden_dim)
+
+    def forward(self, x):
+        # x: [Batch, Channel, Time] -> (B, 29, 64)
+        x = x.permute(0, 2, 1) # [B, T, C]
+        
+        # Linear Projection
+        x = self.input_proj(x) # [B, 64, 256]
+        x = self.pe(x)
+        
+        # Transformer Process (全序列交互)
+        x = self.transformer(x) # [B, 64, 256]
+        
+        # Global Pooling (将64帧的信息压缩到1帧)
+        # 这里的 Mean 包含了所有时刻的信息
+        x = torch.mean(x, dim=1, keepdim=True) # [B, 1, 256]
+        
+        x = self.output_proj(x) # [B, 1, 64]
+        
+        # 变回 [B, 64, 1] 以符合 VQ 输入习惯
+        return x.permute(0, 2, 1) 
+
+class TransformerMotionDecoder(nn.Module):
+    def __init__(self, output_dim, hidden_dim, d_model=256, nhead=4, num_layers=4, seq_len=64):
+        super().__init__()
+        self.seq_len = seq_len
+        
+        # 1. Expand Latent (1 -> 64)
+        self.input_proj = nn.Linear(hidden_dim, d_model)
+        
+        # 2. Transformer
+        self.pe = TransformerPositionalEncoding(d_model)
+        # Decoder 同样使用 EncoderLayer 结构（非自回归，因为是一次性生成）
+        decoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=512, batch_first=True)
+        self.transformer = nn.TransformerEncoder(decoder_layer, num_layers=num_layers)
+        
+        # 3. Output Projection
+        self.output_proj = nn.Linear(d_model, output_dim)
+
+    def forward(self, x):
+        # x: [Batch, Hidden_Dim, 1]
+        x = x.permute(0, 2, 1) # [B, 1, Hidden]
+        
+        # Expand: 将 1 个 Latent 广播复制到 64 个时间步
+        x = self.input_proj(x) # [B, 1, d_model]
+        x = x.repeat(1, self.seq_len, 1) # [B, 64, d_model]
+        
+        # 加上位置编码，让网络知道第1个复制品是第1帧，第64个是第64帧
+        x = self.pe(x)
+        
+        # Transformer 恢复时序细节
+        x = self.transformer(x)
+        
+        # Output
+        x = self.output_proj(x) # [B, 64, Output_Dim]
+        
+        return x.permute(0, 2, 1) # [B, Output_Dim, 64]
+
+
+
+
+
 # ==========================================
 # 4. Main Dual-Encoder VQ-VAE Model (Corrected for Paper)
 # ==========================================
-
 class DualMotionVQVAE(nn.Module):
     def __init__(self, 
-                 human_input_dim=263, # SMPL feature dim
-                 robot_input_dim=29,  # G1 Robot dim
+                 human_input_dim=263, 
+                 robot_input_dim=29, 
                  hidden_dim=64, 
                  codebook_size=1024, 
-                 arch='resnet', 
+                 arch='transformer',  # 默认改为 transformer
                  method='hybrid', 
-                 n_layers=4):
+                 n_layers=4,
+                 window_size=64):
         super(DualMotionVQVAE, self).__init__()
         
+        self.arch = arch
+        self.window_size = window_size # <--- [新增] 记录下来
+        
         # --- Dual Encoders ---
-        # 1. Human Encoder: Maps SMPL features to Latent Space
-        self.human_encoder = Encoder(human_input_dim, hidden_dim, arch=arch)
+        if arch == 'transformer':
+            # Transformer 架构：更深，带全局注意力
+            # d_model=256 是 Transformer 的内部维度，hidden_dim=64 是量化维度
+            self.human_encoder = TransformerMotionEncoder(human_input_dim, hidden_dim, d_model=256, num_layers=4)
+            self.robot_encoder = TransformerMotionEncoder(robot_input_dim, hidden_dim, d_model=256, num_layers=4)
+        # === [新增] 全分辨率 ResNet ===
+        elif arch == 'resnet_no_down':
+            self.human_encoder = NoDownsampleEncoder(human_input_dim, hidden_dim)
+            self.robot_encoder = NoDownsampleEncoder(robot_input_dim, hidden_dim)
+        # ============================
+        else:
+            # 旧架构兼容 (Simple / ResNet)
+            self.human_encoder = Encoder(human_input_dim, hidden_dim, arch=arch)
+            self.robot_encoder = Encoder(robot_input_dim, hidden_dim, arch=arch)
         
-        # 2. Robot Encoder: Maps Robot joints to Latent Space
-        self.robot_encoder = Encoder(robot_input_dim, hidden_dim, arch=arch)
-        
-        # --- Shared Quantizer (The "Bridge") ---
+        # --- Shared Quantizer ---
         if method == 'standard':
             self.quantizer = VectorQuantizer(codebook_size, hidden_dim, use_ema=False)
         elif method == 'ema':
@@ -355,27 +545,38 @@ class DualMotionVQVAE(nn.Module):
             self.quantizer = ResidualVQ(num_quantizers=n_layers, num_embeddings=codebook_size, 
                                         embedding_dim=hidden_dim, use_ema=True)
         elif method == 'fsq':
-            self.quantizer = FSQ(levels=[4,4,4,4,4], input_dim=hidden_dim, hidden_dim=hidden_dim)
+            self.quantizer = FSQ(levels=[8,5,5,5], input_dim=hidden_dim, hidden_dim=hidden_dim)
         elif method == 'lfq':
             self.quantizer = LFQ(input_dim=hidden_dim, codebook_dim=10)
         elif method == 'hybrid':
+            # 推荐配置：Hybrid (FSQ Base + RVQ Detail)
             self.quantizer = HybridVQ(hidden_dim=hidden_dim, fsq_levels=[8,5,5,5], vq_codebook_size=512)
+        # === [必须添加这一段] ===
+        elif method == 'ae':
+            # AE 模式：直接使用 IdentityVQ，不做量化，不做 VQ，只是普通的自编码器
+            self.quantizer = IdentityVQ()
+        # =======================
         else:
             raise ValueError(f"Unknown quantization method: {method}")
         
-        # --- Robot Decoder Only (Per Paper Figure 1) ---
-        # 论文中主要关注从 Latent 解码回 Robot。
-        # 如果训练还需要重建 Human 以保证 encoder 质量，可以加 human_decoder，
-        # 但 Figure 1 强调的是 Robot Execution，通常我们希望 Latent 包含的信息足以重建 Robot 动作。
-        self.robot_decoder = Decoder(robot_input_dim, hidden_dim, arch=arch)
+        # --- Robot Decoder Only ---
+        if arch == 'transformer':
+            # [修改] 2. 将 window_size 传给 seq_len
+            self.robot_decoder = TransformerMotionDecoder(
+                robot_input_dim, 
+                hidden_dim, 
+                d_model=256, 
+                num_layers=4, 
+                seq_len=window_size  # <--- 关键修改：不再是写死的 64
+            )
+        # === [新增] 全分辨率 ResNet Decoder ===
+        elif arch == 'resnet_no_down':
+            self.robot_decoder = NoDownsampleDecoder(robot_input_dim, hidden_dim)
+        # =====================================
+        else:
+            self.robot_decoder = Decoder(robot_input_dim, hidden_dim, arch=arch)
 
     def forward(self, x_robot=None, x_human=None):
-        """
-        支持三种模式：
-        1. 仅机器人训练: forward(x_robot=data)
-        2. 仅人类推理/生成: forward(x_human=data) -> decode to robot
-        3. 对齐训练 (Alignment): forward(x_robot=data, x_human=data)
-        """
         outputs = {}
         
         # --- Branch 1: Robot Flow ---
@@ -386,13 +587,13 @@ class DualMotionVQVAE(nn.Module):
             # Quantize
             loss_vq_r, z_q_robot, metrics_r = self.quantizer(z_e_robot)
             
-            # Decode (Reconstruction)
+            # Decode
             x_recon_robot = self.robot_decoder(z_q_robot)
             outputs['robot'] = {
                 'recon': x_recon_robot.permute(0, 2, 1),
                 'loss_vq': loss_vq_r,
                 'metrics': metrics_r,
-                'z_e': z_e_robot # For alignment loss
+                'z_e': z_e_robot # For alignment
             }
 
         # --- Branch 2: Human Flow ---
@@ -400,19 +601,17 @@ class DualMotionVQVAE(nn.Module):
             x_human = x_human.permute(0, 2, 1) # [B, C, T]
             z_e_human = self.human_encoder(x_human)
             
-            # Quantize (Shared Codebook!)
-            # 注意：人类分支通常用于 inference 或 alignment training
+            # Quantize (Shared Codebook)
             loss_vq_h, z_q_human, metrics_h = self.quantizer(z_e_human)
             
             # Cross-Decoding: Human Latent -> Robot Body
-            # 这是论文核心：Implicit Retargeting
             x_retargeted = self.robot_decoder(z_q_human)
             
             outputs['human'] = {
                 'retargeted': x_retargeted.permute(0, 2, 1),
                 'loss_vq': loss_vq_h,
                 'metrics': metrics_h,
-                'z_e': z_e_human # For alignment loss
+                'z_e': z_e_human # For alignment
             }
             
         return outputs

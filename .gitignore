@@ -1,5 +1,4 @@
 data_raw/
-data/
-
-
-checkpoints/
+plots/rendered_viewport
+data/processed
+data/raw

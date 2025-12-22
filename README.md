@@ -107,7 +107,7 @@ install -e .
 
 1. **Data Download:**
 ```bash
-   python scripts/download_data.py
+   python scripts/data/download_data.py
 ```
 
 2. **Unzip Data:**
